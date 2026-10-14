@@ -1,0 +1,24 @@
+{
+    "server": {
+        "host": "0.0.0.0",
+        "port": 8081,
+        "debug": false
+    },
+    "security": {
+        "api_key": "zkteco-adms-key-2024",
+        "allowed_ips": [],
+        "enable_logging": true
+    },
+    "odoo": {
+        "url": "http://196.189.236.132:8069/",
+        "db": "odoohp18",
+        "sync_interval": 300,
+        "max_buffer_size": 1000,
+        "auto_clear_buffer": false
+    },
+    "zkteco": {
+        "device_timeout": 30,
+        "heartbeat_interval": 10,
+        "command_retry_count": 3
+    }
+}
