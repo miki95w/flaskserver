@@ -11,7 +11,7 @@
     },
     "odoo": {
         "url": "http://196.189.236.132:8069/",
-        "db": "odoohp18",
+        "db": "odoo18hp",
         "sync_interval": 300,
         "max_buffer_size": 1000,
         "auto_clear_buffer": false
