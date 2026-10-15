@@ -132,12 +132,12 @@ if os.path.exists(config_path):
         with open(config_path, 'r') as f:
             cfg_file = json.load(f)
             if 'security' in cfg_file and 'api_key' in cfg_file['security']:
-                FLASK_ADMS_CONFIG['api_key'] = cfg_file['security']['api_key']
+                FLASK_ADMS_CONFIG['api_key'] = str(cfg_file['security']['api_key']).strip()
             if 'server' in cfg_file and 'port' in cfg_file['server']:
                 server_port = cfg_file['server']['port']
             if 'odoo' in cfg_file:
-                FLASK_ADMS_CONFIG['odoo_url'] = cfg_file['odoo'].get('url', '')
-                FLASK_ADMS_CONFIG['odoo_db'] = cfg_file['odoo'].get('db', '')
+                FLASK_ADMS_CONFIG['odoo_url'] = str(cfg_file['odoo'].get('url', '')).strip()
+                FLASK_ADMS_CONFIG['odoo_db'] = str(cfg_file['odoo'].get('db', '')).strip()
             if 'device' in cfg_file:
                 FLASK_ADMS_CONFIG['timezone'] = str(cfg_file['device'].get('timezone', FLASK_ADMS_CONFIG['timezone']))
             if 'server' in cfg_file:
@@ -795,12 +795,21 @@ def get_users_from_device():
         json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'device_users.json')
         if os.path.exists(json_path):
             try:
+                target_sn = request.args.get('sn') or request.args.get('device_sn')
+                if not target_sn and devices:
+                    target_sn = list(devices.keys())[0]
+                if not target_sn:
+                    target_sn = "SFAA252800444"
+
                 with open(json_path, 'r') as f:
                     cached = json.load(f)
                     for u in cached:
+                        raw_pin = str(u.get('user_id', '')).strip()
+                        clean_pin = raw_pin.lstrip('0') or raw_pin
+                        name = u.get('name', '').strip()
                         all_users.append({
-                            "device_sn": "AEXH214460630",
-                            "raw_data": f"pin={u.get('user_id', '')}\tname={u.get('name', '')}",
+                            "device_sn": target_sn,
+                            "raw_data": f"pin={clean_pin}\tname={name}",
                             "timestamp": datetime.now().isoformat()
                         })
             except Exception as e:
@@ -924,9 +933,33 @@ def cdata():
     """Handle real-time attendance and table data from devices."""
     sn = request.args.get("SN")
     touch_device(sn)
-    table = (request.args.get("table") or request.args.get("tablename") or "").lower()
+    table = (request.args.get("table") or request.args.get("tablename") or request.args.get("type") or "").lower()
 
     if request.method == "GET":
+        options = request.args.get("options")
+        if options:
+            pushver = request.args.get("pushver", "2.4.1")
+            logger.info(f"⚙️ Handshake options requested by device {sn} (pushver={pushver})")
+            config_lines = [
+                f"GET OPTION FROM: {sn}",
+                "ATTLOGStamp=0",
+                "OPERLOGStamp=0",
+                "ATTPHOTOStamp=0",
+                "ErrorDelay=60",
+                "Delay=10",
+                "TransTimes=00:00;23:59",
+                "TransInterval=1",
+                "TransFlag=TransData AttLog OpLog AttPhoto EnrollUser ChgUser EnrollFP ChgFP USER ATTLOG BIODATA",
+                "TimeZone=3",
+                "Realtime=1",
+                "Encrypt=0",
+                f"ServerVer={pushver}",
+                f"PushProtVer={pushver}",
+                "PushOptionsFlag=1",
+            ]
+            response_text = "\n".join(config_lines) + "\n"
+            logger.info(f"📤 Handshake response sent to {sn}:\n{response_text}")
+            return Response(response_text, mimetype="text/plain")
         return Response("OK\n", mimetype="text/plain")
 
     body = request.get_data(as_text=True)
@@ -967,6 +1000,37 @@ def cdata():
         log_device_activity(sn, f"Processed {attendance_count} attendance records")
 
         if new_records:
+            # Auto-extract and register any new device users discovered in the punch logs
+            discovered_users = []
+            if sn not in users_buffer:
+                users_buffer[sn] = []
+            existing_pins = set()
+            for u in users_buffer[sn]:
+                raw = u.get("raw_data", "")
+                if "pin=" in raw:
+                    for part in raw.split("\t"):
+                        if part.startswith("pin="):
+                            existing_pins.add(part.split("=")[1].strip())
+
+            for rec in new_records:
+                uid = str(rec.get('user_id', '')).strip()
+                if uid and uid not in existing_pins:
+                    existing_pins.add(uid)
+                    users_buffer[sn].append({
+                        "device_sn": sn,
+                        "raw_data": f"pin={uid}\tname=User {uid}",
+                        "timestamp": datetime.now().isoformat()
+                    })
+                    discovered_users.append({'pin': uid, 'name': f'User {uid}'})
+
+            if discovered_users:
+                logger.info(f"✨ Auto-discovered {len(discovered_users)} user IDs from punch logs for device {sn}. Pushing to Odoo...")
+                push_to_odoo('/zkteco/push/users', {
+                    'api_key': FLASK_ADMS_CONFIG['api_key'],
+                    'device_sn': sn,
+                    'users': discovered_users
+                })
+
             with buffer_lock:
                 try:
                     with get_db_connection() as conn:
@@ -1001,15 +1065,32 @@ def cdata():
             }):
                 remove_pushed_records(new_records)
 
-    elif table == "user" or "tablename=user" in request.url:
-        log_device_activity(sn, "User data received via cdata")
+    elif (
+        table in ("user", "userinfo", "personnel")
+        or "tablename=user" in request.url
+        or "tablename=userinfo" in request.url
+        or "type=user" in request.url
+        or "type=userinfo" in request.url
+        or ("pin=" in body.lower() and ("name=" in body.lower() or "cardno=" in body.lower() or "privilege=" in body.lower()))
+    ):
+        log_device_activity(sn, "User data received via cdata/querydata")
         logger.info(f"👥 [ User Data Incoming ] -> SN: {sn}")
         count = process_user_data(sn, body)
-        logger.info(f"✅ Processed {count} users from cdata")
+        logger.info(f"✅ Processed {count} users from cdata/querydata")
 
-    elif table == "tabledata" or "tablename=templatev10" in request.url:
-        log_device_activity(sn, "Biometric data received")
-        logger.info(f"🧬 [ Biometric Vector Data Stream ] -> SN: {sn} (Fingerprints Loaded)")
+    elif table == "options":
+        log_device_activity(sn, "Device options payload received")
+        logger.info(f"⚙️ [ Device Options Received ] -> SN: {sn} | Content: {body[:300]}")
+
+    elif table == "operlog":
+        log_device_activity(sn, "Operation log received")
+        logger.info(f"📜 [ Operation Log Received ] -> SN: {sn}")
+        if "user " in body.lower() or "pin=" in body.lower():
+            process_user_data(sn, body)
+
+    elif table in ("tabledata", "biodata", "biophoto") or "tablename=templatev10" in request.url:
+        log_device_activity(sn, "Biometric vector data received")
+        logger.info(f"🧬 [ Biometric Vector Data Stream ] -> SN: {sn} (Biometrics/Templates Loaded)")
 
     return Response("OK\n", mimetype="text/plain")
 
@@ -1160,21 +1241,15 @@ def trigger_user_fetch(sn):
     if auth_error:
         return auth_error
     
-    # Try multiple user command formats for F22 compatibility
+    # Try multiple user command formats for maximum compatibility across firmware
     user_commands = [
+        "DATA QUERY tablename=user,fielddesc=*,filter=*",
+        "DATA QUERY tablename=userinfo,fielddesc=*,filter=*",
         "DATA QUERY tablename=user",
-        "DATA QUERY tablename=USER",
         "DATA QUERY tablename=userinfo",
-        "DATA QUERY tablename=USERINFO",
-        "DATA QUERY tablename=personnel",
-        "DATA QUERY tablename=PERSONNEL",
         "DATA OPTION user",
-        "DATA OPTION USER",
         "DATA user",
-        "DATA USER",
-        "OPTION user",
-        "OPTION USER",
-        "INFO"  # Get device info to help identify model
+        "INFO"
     ]
     
     logger.info(f"🔍 Trying multiple user commands for device {sn}")
@@ -1200,7 +1275,8 @@ def trigger_attendance_fetch(sn):
     if auth_error:
         return auth_error
     
-    cmd_id, cmd_string = queue_device_command(sn, "DATA QUERY tablename=transaction")
+    queue_device_command(sn, "CHECK")
+    cmd_id, cmd_string = queue_device_command(sn, "DATA QUERY tablename=transaction,fielddesc=*,filter=*")
     
     return jsonify({
         "status": "Attendance fetch queued",
